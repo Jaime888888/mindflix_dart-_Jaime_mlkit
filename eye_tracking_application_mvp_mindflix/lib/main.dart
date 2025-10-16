@@ -1,127 +1,272 @@
-import 'package:flutter/material.dart';
-import 'package:opencv_dart/opencv_dart.dart';
-import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
-import 'package:camera/camera.dart';
-import 'package:eye_tracking/eye_tracking.dart';
+import 'dart:async';
 import 'dart:io';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:camera/camera.dart';
+import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 
-void main() {
-  runApp(const MyApp());
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // 🔹 Lock app to landscape orientation
+  await SystemChrome.setPreferredOrientations([
+    DeviceOrientation.landscapeLeft,
+    DeviceOrientation.landscapeRight,
+  ]);
+
+  // 🔹 Use front camera (webcam for emulator)
+  final cameras = await availableCameras();
+  final frontCamera = cameras.firstWhere(
+    (cam) => cam.lensDirection == CameraLensDirection.front,
+    orElse: () => cameras.first,
+  );
+
+  runApp(MyApp(camera: frontCamera));
 }
 
 class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+  final CameraDescription camera;
+  const MyApp({super.key, required this.camera});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
-      theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
-      ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      title: 'Gaze Tracker (ML Kit)',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData.dark(),
+      home: GazeTracker(camera: camera),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
+class GazeTracker extends StatefulWidget {
+  final CameraDescription camera;
+  const GazeTracker({super.key, required this.camera});
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  State<GazeTracker> createState() => _GazeTrackerState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+class _GazeTrackerState extends State<GazeTracker> {
+  late CameraController _controller;
+  late FaceDetector _faceDetector;
+  bool _isReady = false;
+  bool _isRunning = false;
+  int _secondsLeft = 10;
+  Timer? _frameTimer;
+  Timer? _countdownTimer;
+  int _leftCount = 0;
+  int _rightCount = 0;
+  double _dotX = 0; // 👁 dot position on screen
 
-  void _incrementCounter() {
+  @override
+  void initState() {
+    super.initState();
+    _initCamera();
+    _initFaceDetector();
+  }
+
+  Future<void> _initCamera() async {
+    _controller = CameraController(
+      widget.camera,
+      ResolutionPreset.low,
+      enableAudio: false,
+    );
+    await _controller.initialize();
+    if (!mounted) return;
+    setState(() => _isReady = true);
+  }
+
+  void _initFaceDetector() {
+    _faceDetector = FaceDetector(
+      options: FaceDetectorOptions(
+        enableLandmarks: true,
+        enableContours: true,
+        performanceMode: FaceDetectorMode.fast,
+      ),
+    );
+  }
+
+  void _startTimer() {
+    if (_isRunning) return;
     setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+      _isRunning = true;
+      _secondsLeft = 10;
+      _leftCount = 0;
+      _rightCount = 0;
+      _dotX = MediaQuery.of(context).size.width / 2;
     });
+
+    _countdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+      setState(() => _secondsLeft--);
+      if (_secondsLeft <= 0) {
+        timer.cancel();
+        _stopTracking();
+      }
+    });
+
+    _frameTimer = Timer.periodic(const Duration(milliseconds: 500), (_) async {
+      if (!_controller.value.isInitialized || _controller.value.isTakingPicture)
+        return;
+      try {
+        final pic = await _controller.takePicture();
+        await _analyzeFrame(pic.path);
+      } catch (e) {
+        debugPrint("Frame error: $e");
+      }
+    });
+  }
+
+  Future<void> _analyzeFrame(String path) async {
+    final inputImage = InputImage.fromFilePath(path);
+    final faces = await _faceDetector.processImage(inputImage);
+    if (faces.isEmpty) return;
+
+    final width = MediaQuery.of(context).size.width;
+    double avgX = 0;
+    for (final face in faces) {
+      avgX += face.boundingBox.center.dx;
+    }
+    avgX /= faces.length;
+
+    // Normalize and invert so movement feels natural (mirror effect)
+    double normalizedX = (1 - (avgX / 300)) * width;
+    setState(() {
+      _dotX = normalizedX.clamp(0, width);
+    });
+
+    // Count gaze direction
+    if (normalizedX < width / 2) {
+      _leftCount++;
+    } else {
+      _rightCount++;
+    }
+  }
+
+  Future<void> _stopTracking() async {
+    _frameTimer?.cancel();
+    _countdownTimer?.cancel();
+    setState(() => _isRunning = false);
+
+    String result;
+    if (_leftCount > _rightCount) {
+      result = "👁 Looked more at LEFT image";
+    } else if (_rightCount > _leftCount) {
+      result = "👁 Looked more at RIGHT image";
+    } else {
+      result = "🤷‍♂️ Looked equally at both";
+    }
+
+    if (mounted) {
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => AlertDialog(
+          title: const Text("Result"),
+          content: Text("$_leftCount left vs $_rightCount right\n\n$result"),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text("OK"),
+            ),
+          ],
+        ),
+      );
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    _faceDetector.close();
+    _frameTimer?.cancel();
+    _countdownTimer?.cancel();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
+    if (!_isReady) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+
+    final width = MediaQuery.of(context).size.width;
+
     return Scaffold(
-      appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
-      ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: <Widget>[
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+      body: Stack(
+        children: [
+          // 🔹 Equal-sized images side by side
+          Row(
+            children: [
+              Expanded(
+                child: Image.asset(
+                  'images/golden-retriever-tongue-out.jpg',
+                  fit: BoxFit.cover,
+                ),
+              ),
+              Expanded(
+                child: Image.asset('images/orange-cat.jpg', fit: BoxFit.cover),
+              ),
+            ],
+          ),
+
+          // 🔹 Floating gaze dot
+          AnimatedPositioned(
+            duration: const Duration(milliseconds: 300),
+            left: _dotX - 10,
+            top: 40,
+            child: Container(
+              width: 20,
+              height: 20,
+              decoration: BoxDecoration(
+                color: Colors.blueAccent,
+                shape: BoxShape.circle,
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.blueAccent.withOpacity(0.6),
+                    blurRadius: 8,
+                    spreadRadius: 3,
+                  ),
+                ],
+              ),
             ),
-          ],
-        ),
+          ),
+
+          // 🔹 Bottom overlay (timer + button)
+          Align(
+            alignment: Alignment.bottomCenter,
+            child: Padding(
+              padding: const EdgeInsets.only(bottom: 30),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    _isRunning
+                        ? "Time left: $_secondsLeft s"
+                        : "Press Start to begin",
+                    style: const TextStyle(fontSize: 24, color: Colors.white),
+                  ),
+                  const SizedBox(height: 10),
+                  ElevatedButton(
+                    onPressed: _isRunning ? null : _startTimer,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.greenAccent.shade700,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 60,
+                        vertical: 20,
+                      ),
+                    ),
+                    child: const Text(
+                      "Start 10-second Test",
+                      style: TextStyle(fontSize: 20),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
-      ), // This trailing comma makes auto-formatting nicer for build methods.
     );
   }
 }
