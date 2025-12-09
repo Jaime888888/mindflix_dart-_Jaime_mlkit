@@ -181,6 +181,8 @@ class _GazeTrackerState extends State<GazeTracker>
       final l = f.landmarks[FaceLandmarkType.leftEye];
       final r = f.landmarks[FaceLandmarkType.rightEye];
       if (l != null && r != null) {
+        debugPrint(
+            'Face ${faces.indexOf(f)} eye landmarks -> left: ${l.position}, right: ${r.position}');
         x += (l.position.x + r.position.x) / 2;
         y += (l.position.y + r.position.y) / 2;
         n++;
